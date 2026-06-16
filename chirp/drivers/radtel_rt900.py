@@ -2,6 +2,7 @@
 # Derived from prior copyrighted work:
 # Copyright 2024 Pavel Moravec, OK2MOP <moravecp.cz@gmail.com>
 # Copyright 2023 Jim Unroe <rock.unroe@gmail.com>
+#
 # CHIRP driver for Ratel RT-900 Series radios
 #
 # This program is free software: you can redistribute it and/or modify
@@ -40,18 +41,49 @@ from chirp.settings import (
     RadioSettingValueString,
     RadioSettingValueMap,
     MemSetting,
-    InvalidValueError
+    InvalidValueError,
 )
 from textwrap import dedent
 from chirp.drivers import (
     baofeng_uv17Pro,
     mml_jc8810,
-    baofeng_common as bfc
+    baofeng_common as bfc,
 )
 
 import struct
 
 LOG = logging.getLogger(__name__)
+
+# FHSS Code is a 24-bit per-channel value. The OEM CPS represents an
+# unset code as 0xFFFFFF in raw memory and as a blank field in the UI.
+# When a code is set, the OEM also writes 0xA0 into the adjacent flag
+# byte; when the code is cleared, that flag byte is restored to 0xFF.
+FHSS_CODE_NULL = 0xFFFFFF
+FHSS_CODE_FLAG_ACTIVE = 0xA0
+FHSS_CODE_FLAG_NULL = 0xFF
+
+
+def _fhss_code_to_text(raw_code):
+    raw = int(raw_code)
+    if raw == FHSS_CODE_NULL:
+        return ""
+    return "%06X" % (raw & 0x7FFFFF)
+
+
+def _validate_fhss_code(value):
+    s = str(value).strip()
+    if s == "":
+        return value
+    try:
+        v = int(s, 16)
+    except ValueError:
+        raise InvalidValueError(
+            "FHSS Code must be a hex value (e.g. 1A2B3C) or blank")
+    if not (0 <= v <= 0x7FFFFF):
+        raise InvalidValueError(
+            "FHSS Code must be between 000000 and 7FFFFF")
+    return value
+
 
 MEM_FORMAT = """
 struct {
@@ -71,9 +103,9 @@ struct {
      bcl:1,           //     BCL
      scan:1,          //     Scan  0 = Skip, 1 = Scan
      am_modulation:1, //     Per chan AM modulation
-     learning:1;      //     Learning
-  lbcd code[3];       // 0-2 Code
-  u8 unknown6;        // 3
+     learning:1;      //     FHSS Learning
+  ul24 code;          // 0-2 FHSS Code (little-endian, 0-0x7FFFFF)
+  u8 code_flag;       // 3   0xA0 when Code set, 0xFF when blank
   char name[12];      // 4-F 12-character Alpha Tag
 } memory[%d];
 
@@ -186,13 +218,14 @@ struct {
   u8 unknown_9025;    // 9025 Always 0x01 on all RT-900 variants
   u8 unknown_9026;    // 9026
   u8 unknown_9027;    // 9027
-  u8 unknown_9028;    // 9028
+  u8 zone_or_channel; // 9028 Zone or Channel (RT-920 fw V0.16)
+                      //        0: Zone mode, 1: Channel mode
   u8 unused_9029:6,   // 9029
      qtsave:2;        //      QT Save Type
-  u8 skey2_sp;        // 902A Skey2 Short
-  u8 skey2_lp;        // 902B Skey2 Long
-  u8 skey3_sp;        // 902C Skey3 Short
-  u8 skey3_lp;        // 902D Skey3 Long
+  u8 skey2_sp0;       // 902A Skey2 Short RT-900BT
+  u8 skey2_sp1;       // 902B Skey2 Short, Long RT-900BT
+  u8 skey2_lp;        // 902C Skey2 Long, Skey3 Short RT-900BT
+  u8 skey3_sp;        // 902D Skey3 Short
   u8 topkey_sp;       // 902E Top Key (RT-470L)
   u8 unused_902f:6,   // 902F
      rxendtail:2;     //      RX END TAIL (RT-470)
@@ -200,7 +233,7 @@ struct {
   u8 noise_reduction; // 9031 NOISE REDUCTION
   u8 unknown_9032;    // 9032
   u8 unknown_9033;    // 9033
-  u8 unknown_9034;    // 9034
+  u8 fm_interrupt;    // 9034
   u8 unknown_9035;    // 9035
   u8 unknown_9036;    // 9036
   u8 unknown_9037;    // 9037
@@ -222,8 +255,8 @@ struct {
 
 #seekto 0xA020;
 struct {
-  u8 code[5];         //      5-character DTMF Encoder Groups
-  u8 unused[11];
+  u8 code[6];         //      6-character DTMF PTT-IDs
+  u8 unused[10];
 } pttid[15];
 
 #seekto 0xD000; // radio operationg mode
@@ -427,12 +460,12 @@ class RT900BT(chirp_common.CloneModeRadio):
         ("Default", 0xff), ("GMRS", 0xa5),
         ("PMR", 0x66), ("144-146/430-440", 0x55),
         ("Super", 0x56), ("Factory", 0x00),
-        ("unknown Mode 2", 0x28)
+        ("unknown Mode 2", 0x28),
     ]
     POWER_LEVELS = [
         chirp_common.PowerLevel("High", watts=8.00),
         chirp_common.PowerLevel("Middle", watts=4.00),
-        chirp_common.PowerLevel("Low", watts=1.00)
+        chirp_common.PowerLevel("Low", watts=1.00),
     ]
 
     SKEY_LIST = ["Radio",
@@ -442,7 +475,7 @@ class RT900BT(chirp_common.CloneModeRadio):
                  "NOAA",
                  "SOS",
                  "Switch AM/FM",
-                 "Bluetooth"]
+                 "Bluetooth",]
     SKEY_SP_LIST = SKEY_LIST
 
     _upper = 999  # fw 1.20 expands from 512 to 999 channels_steps,
@@ -465,7 +498,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         (0x8000, 0x8040),
         (0x9000, 0x9040),
         (0xA000, 0xA140),
-        (0xD000, 0xD040)  # Radio mode hidden setting
+        (0xD000, 0xD040),  # Radio mode hidden setting
      ]
 
     _calibration = (0xF000, 0xF250)  # Calibration data
@@ -475,13 +508,18 @@ class RT900BT(chirp_common.CloneModeRadio):
     _has_am_per_channel = True
     _has_am_switch = not _has_am_per_channel
     _has_single_mode = True
+    _has_zone_or_channel = False
+    _has_zone_names = False
+    _has_sp0 = True  # spkey addresses are shifted -1
+    _has_hf = False
+
     _valid_chars = chirp_common.CHARSET_ALPHANUMERIC + \
         "`~!@#$%^&*()-=_+[]\\{}|;':\",./<>?"
 
     _steps = [2.5, 5.0, 6.25, 10.0, 12.5, 20.0, 25.0, 50.0, 8.33]
     _step_map = [("2.5 K", 0), ("5.0 K", 1), ("6.25 K", 2), ("8.33 K", 8),
                  ("10.0 K", 3), ("12.5 K", 4), ("20.0 K", 5), ("25.0 K", 6),
-                 ("50.0 K", 7)]
+                 ("50.0 K", 7),]
     _bandwidth_list = ["Wide (25 KHz)", "Narrow (12.5 KHz)"]
     _offset_list = ["Off", "+", "-"]
     _rx_modulation_list = ["FM", "AM"]
@@ -519,6 +557,8 @@ class RT900BT(chirp_common.CloneModeRadio):
         """Upload to radio"""
         try:
             do_upload(self)
+        except errors.RadioError:
+            raise
         except Exception:
             # If anything unexpected happens, make sure we raise
             # a RadioError and log the problem
@@ -538,139 +578,181 @@ class RT900BT(chirp_common.CloneModeRadio):
         # Menu 12: TOT
         rs = RadioSettingValueList(TOT_LIST, current_index=_settings.tot)
         rset = MemSetting("settings.tot", "Time Out Timer", rs)
+        rset.set_doc("Set the Time Out Timer for transmit (Seconds).")
         basic.append(rset)
 
         # Menu 00: SQL
         rs = RadioSettingValueInteger(0, 9, _settings.sql)
         rset = MemSetting("settings.sql", "Squelch Level", rs)
+        rset.set_doc("Set the receive squelch level. Setting to zero will "
+                     "disable the squlech.")
         basic.append(rset)
 
         # Menu 13: VOX
         rs = RadioSettingValueList(OFF1TO9_LIST, current_index=_settings.vox)
         rset = MemSetting("settings.vox", "VOX", rs)
+        rset.set_doc("Set the VOX sensitivity level.")
         basic.append(rset)
 
         # Menu 39: VOX DELAY
         rs = RadioSettingValueList(VOXD_LIST, current_index=_settings.voxd)
         rset = MemSetting("settings.voxd", "VOX Delay", rs)
+        rset.set_doc("Set the VOX delay time (Seconds).")
         basic.append(rset)
 
         # Menu 15: VOICE
         rs = RadioSettingValueBoolean(_settings.voice)
         rset = MemSetting("settings.voice", "Voice Prompts", rs)
+        rset.set_doc("Set the radio voice prompts.")
         basic.append(rset)
 
         # Menu 17: LANGUAGE
         rs = RadioSettingValueList(LANGUAGE_LIST,
                                    current_index=_settings.language)
         rset = MemSetting("settings.language", "Language", rs)
+        rset.set_doc("Set the radio menu and voice promopts language.")
         basic.append(rset)
 
         # Menu 23: ABR
         rs = RadioSettingValueList(ABR_LIST, current_index=_settings.abr)
         rset = MemSetting("settings.abr", "Auto BackLight", rs)
+        rset.set_doc("Set the radio Backlight auto switch off time (Seconds).")
         basic.append(rset)
 
         # Menu 19: SC-REV
         rs = RadioSettingValueList(SCREV_LIST, current_index=_settings.screv)
         rset = MemSetting("settings.screv", "Scan Resume Method", rs)
+        rset.set_doc("Set the Scan Resume method: TO (time scanning), "
+                     "CO (carrier detect), SE (search scanning).")
         basic.append(rset)
 
         # Menu 10: SAVE
         rs = RadioSettingValueList(SAVE_LIST,
                                    current_index=_settings.save)
         rset = MemSetting("settings.save", "Battery Save Mode", rs)
+        rset.set_doc("Set the Battery power save mode.")
         basic.append(rset)
 
         # Menu 42: MDF-A
         rs = RadioSettingValueList(MDF_LIST, current_index=_settings.mdfa)
         rset = MemSetting("settings.mdfa", "Memory Display Format A", rs)
+        rset.set_doc("Set A band display mode.")
         basic.append(rset)
 
         # Menu 43: MDF-B
         rs = RadioSettingValueList(MDF_LIST, current_index=_settings.mdfb)
         rset = MemSetting("settings.mdfb", "Memory Display Format B", rs)
+        rset.set_doc("Set B band display mode.")
         basic.append(rset)
 
         # Menu 33: DTMFST (DTMF ST)
         rs = RadioSettingValueList(DTMFST_LIST, current_index=_settings.dtmfst)
         rset = MemSetting("settings.dtmfst", "DTMF Side Tone", rs)
+        rset.set_doc("Set how DTMF tones are heard when a PTT ID DTMF Code "
+                     "is sent.")
         basic.append(rset)
 
         # Menu 37: PTT-LT
         rs = RadioSettingValueList(PTTLT_LIST, current_index=_settings.pttlt)
         rset = MemSetting("settings.pttlt", "PTT Delay", rs)
+        rset.set_doc("Set the PTT delay time.")
         basic.append(rset)
 
         # Menu 36: TONE
         rs = RadioSettingValueList(TONE_LIST, current_index=_settings.tone)
         rset = MemSetting("settings.tone", "Tone-burst Frequency", rs)
+        rset.set_doc("Set the Tone-burst Frequency.")
         basic.append(rset)
 
         # Mneu 29: POWER ON MSG
         rs = RadioSettingValueList(PONMSG_LIST, current_index=_settings.ponmsg)
         rset = MemSetting("settings.ponmsg", "Power On Message", rs)
+        rset.set_doc("Set the Power On Message.")
         basic.append(rset)
 
         # Menu 46: STE
         rs = RadioSettingValueBoolean(_settings.ste)
         rset = MemSetting("settings.ste",
                           "Squelch Tail Eliminate (HT to HT)", rs)
+        rset.set_doc("Set the Squelch Tail Eliminate for HT to HT "
+                     "communication.")
         basic.append(rset)
 
         # Menu 40: RP-STE
         rs = RadioSettingValueList(RPSTE_LIST, current_index=_settings.rpste)
         rset = MemSetting("settings.rpste",
                           "Squelch Tail Eliminate (repeater)", rs)
+        rset.set_doc("Set the Squelch Tail Eliminate time for repeater "
+                     "communication.")
         basic.append(rset)
 
         # Menu 41: RPT-RL
         rs = RadioSettingValueList(RPSTE_LIST, current_index=_settings.rptrl)
         rset = MemSetting("settings.rptrl", "STE Repeater Delay", rs)
+        rset.set_doc("Set the delay time for Squelch Tail Eliminate "
+                     "when using a repeater.")
         basic.append(rset)
 
         # Menu 38: MENU EXIT TIME
         rs = RadioSettingValueList(MENUQUIT_LIST,
                                    current_index=_settings.menuquit)
         rset = MemSetting("settings.menuquit", "Menu Auto Quit", rs)
+        rset.set_doc("Set the time for the radio to automatically exit the "
+                     "menu system.")
         basic.append(rset)
 
         # Menu 34: AUTOLOCK
         rs = RadioSettingValueList(AUTOLK_LIST, current_index=_settings.autolk)
         rset = MemSetting("settings.autolk", "Key Auto Lock", rs)
+        rset.set_doc("Set the time for the radio to automatically lock "
+                     "the keypad.")
         basic.append(rset)
 
-        # Menu 28: CDCSS SAVE MODE
+        # Menu 28: CTCSS SAVE MODE
         rs = RadioSettingValueList(QTSAVE_LIST, current_index=_settings.qtsave)
         rset = MemSetting("settings.qtsave", "QT Save Type", rs)
+        rset.set_doc("Set how the CTCSS/DCS codes are saved to a channel.")
         basic.append(rset)
 
         # Menu 47: AL-MODE
         rs = RadioSettingValueList(ALMODE_LIST, current_index=_settings.almode)
         rset = MemSetting("settings.almode", "Alarm Mode", rs)
+        rset.set_doc("Set how the radio will send an Alarm.")
         basic.append(rset)
 
         # Menu 11: ROGER
         rs = RadioSettingValueList(ROGER_LIST, current_index=_settings.roger)
         rset = MemSetting("settings.roger", "Roger", rs)
+        rset.set_doc("Set the Roger Beep mode for when the PTT is released.")
         basic.append(rset)
 
-        # Menu 44: Alarm Mode
+        # Menu 44: Alarm ON/OFF
         rs = RadioSettingValueBoolean(_settings.alarmsound)
         rset = MemSetting("settings.alarmsound", "Alarm Sound", rs)
+        rset.set_doc("Enable to allow the radio to send an alarm.")
         basic.append(rset)
 
+        if self._has_hf:
+            s1 = "FM/AM/SSB Radio"
+            s2 = "Allow access to FM/AM/SSB RX channels on radio."
+        else:
+            s1 = "FM Radio"
+            s2 = "Allow access to FM broadcast RX channels on radio."
+
         rs = RadioSettingValueInvertedBoolean(not _settings.fmradio)
-        rset = MemSetting("settings.fmradio", "FM Radio", rs)
+        rset = MemSetting("settings.fmradio", s1, rs)
+        rset.set_doc(s2)
         basic.append(rset)
 
         rs = RadioSettingValueBoolean(_settings.kblock)
         rset = MemSetting("settings.kblock", "KB Lock", rs)
+        rset.set_doc("Enable radio keypad locked by default.")
         basic.append(rset)
 
         # Menu 16: BEEP PROMPT
         rs = RadioSettingValueBoolean(_settings.beep)
         rset = MemSetting("settings.beep", "Beep", rs)
+        rset.set_doc("Enable radio keypad Beep when pressing keys.")
         basic.append(rset)
 
         dtmf = RadioSettingGroup("dtmf", "DTMF Settings")
@@ -688,26 +770,31 @@ class RT900BT(chirp_common.CloneModeRadio):
         for i in range(0, 15):
             _codeobj = self._memobj.pttid[i].code
             _code = "".join([DTMF_CHARS[x] for x in _codeobj if int(x) < 0x1F])
-            rs = RadioSettingValueString(0, 5, _code, False)
+            rs = RadioSettingValueString(0, 6, _code, False)
             rs.set_charset(DTMF_CHARS)
             rset = RadioSetting("pttid/%i.code" % i,
                                 "PTT-ID Code %i" % (i + 1), rs)
-            rset.set_apply_callback(apply_code, self._memobj.pttid[i], 5)
+            rset.set_apply_callback(apply_code, self._memobj.pttid[i], 6)
+            rset.set_doc("Set the PTT-ID % i Code DTMF sequence." % (i + 1))
             dtmf.append(rset)
 
         rs = RadioSettingValueList(DTMFSPEED_LIST,
                                    current_index=_dtmf.dtmfon)
-        rset = MemSetting("dtmf.dtmfon", "DTMF Speed (on)", rs)
+        rset = MemSetting("dtmf.dtmfon", "DTMF Speed (On)", rs)
+        rset.set_doc("Set the duration for how long each DMTF tone is ON.")
         dtmf.append(rset)
 
         rs = RadioSettingValueList(DTMFSPEED_LIST,
                                    current_index=_dtmf.dtmfoff)
-        rset = MemSetting("dtmf.dtmfoff", "DTMF Speed (off)", rs)
+        rset = MemSetting("dtmf.dtmfoff", "DTMF Speed (Off)", rs)
+        rset.set_doc("Set the duration for how long the pause is between "
+                     "DTMF tones.")
         dtmf.append(rset)
 
         rs = RadioSettingValueList(
             PTTID_LIST, current_index=_settings.pttid)
         rset = MemSetting("settings.pttid", "PTT ID", rs)
+        rset.set_doc("Set when the PTT-ID is to be sent.")
         dtmf.append(rset)
 
         spec = RadioSettingGroup("spec", self.MODEL + " Specific")
@@ -729,6 +816,7 @@ class RT900BT(chirp_common.CloneModeRadio):
             'and back ON to have the MODE changes take full effect.\n'
             'DO NOT attempt to edit any settings until uploading to and '
             'downloading from the radio with the new operating MODE.')
+        rset.set_doc("Set the radio's Operating Mode.")
         spec.append(rset)
 
         if self._has_bt_denoise:
@@ -736,29 +824,57 @@ class RT900BT(chirp_common.CloneModeRadio):
             rs = RadioSettingValueBoolean(_settings.noise_reduction)
             rset = MemSetting("settings.noise_reduction",
                               "Noise reduction", rs)
+            rset.set_doc("Set the radio's automatic Noise Reduction feature.")
             spec.append(rset)
 
             # Menu 47: Bluetooth
             rs = RadioSettingValueBoolean(_settings.bluetooth)
             rset = MemSetting("settings.bluetooth", "Bluetooth", rs)
+            rset.set_doc("Enable Bluetooth (BLE). "
+                         "Bluetooth can be used to program the radio over a "
+                         "BLE connection.")
             spec.append(rset)
 
         # Menu 23: PF2 Short
+        if self._has_sp0:
+            skey2_sp = _settings.skey2_sp0
+            key = "settings.skey2_sp0"
+        else:
+            skey2_sp = _settings.skey2_sp1
+            key = "settings.skey2_sp1"
+
         rs = RadioSettingValueList(self.SKEY_SP_LIST,
-                                   current_index=_settings.skey2_sp)
-        rset = MemSetting("settings.skey2_sp", "PF2 Key (Short Press)", rs)
+                                   current_index=skey2_sp)
+        rset = MemSetting(key, "PF2 Key (Short Press)", rs)
+        rset.set_doc("Set what a Short Press on the PF2 Key will do.")
         spec.append(rset)
 
         # Menu 24: PF2 Long
+        if self._has_sp0:
+            skey2_lp = _settings.skey2_sp1
+            key = "settings.skey2_sp1"
+        else:
+            skey2_lp = _settings.skey2_lp
+            key = "settings.skey2_lp"
+
         rs = RadioSettingValueList(
-            self.SKEY_LIST, current_index=_settings.skey2_lp)
-        rset = MemSetting("settings.skey2_lp", "PF2 Key (Long Press)", rs)
+            self.SKEY_LIST, current_index=skey2_lp)
+        rset = MemSetting(key, "PF2 Key (Long Press)", rs)
+        rset.set_doc("Set what a Long Press on the PF2 Key will do.")
         spec.append(rset)
 
         # Menu 25: PF3 Short
+        if self._has_sp0:
+            skey3_sp = _settings.skey2_lp
+            key = "settings.skey2_lp"
+        else:
+            skey3_sp = _settings.skey3_sp
+            key = "settings.skey3_sp"
+
         rs = RadioSettingValueList(
-            self.SKEY_LIST, current_index=_settings.skey3_sp)
-        rset = MemSetting("settings.skey3_sp", "PF3 Key (Short Press)", rs)
+            self.SKEY_LIST, current_index=skey3_sp)
+        rset = MemSetting(key, "PF3 Key (Short Press)", rs)
+        rset.set_doc("Set what a Short Press on the PF3 Key will do.")
         spec.append(rset)
 
         if self.MODEL not in ["RT-900_BT", "RT-920"]:
@@ -766,17 +882,44 @@ class RT900BT(chirp_common.CloneModeRadio):
             if self._has_am_switch:
                 rs = RadioSettingValueBoolean(_settings.am_mode)
                 rset = MemSetting("settings.am_mode", "AM Mode", rs)
+                rset.set_doc("Enable to set the RX modulation mode to AM.")
                 spec.append(rset)
 
         # Menu 7: TDR - Dual freq standby
         rs = RadioSettingValueBoolean(_settings.tdr)
         rset = MemSetting("settings.tdr", "TDR - Dual frequency standby", rs)
+        rset.set_doc("Set Dual Frequency Standby (Dual Watch).")
         spec.append(rset)
 
         if self._has_single_mode:
-            # Menu 51: Single Mode - Single fre channel display
+            # Menu 51: Single Mode - Single freq channel display
             rs = RadioSettingValueBoolean(_settings.single_mode)
             rset = MemSetting("settings.single_mode", "Single Mode", rs)
+            rset.set_doc("Set radio to display a single frequency/channel.")
+            spec.append(rset)
+
+        if self.MODEL in ["RT-920"]:
+            # Menu 53: FM Interupt
+            rs = RadioSettingValueBoolean(_settings.fm_interrupt)
+            rset = MemSetting("settings.fm_interrupt", "FM Interrupt", rs)
+            rset.set_doc("While using broadcast FM, "
+                         "allow incoming RX to interrupt the FM "
+                         "broadcast audio.")
+            spec.append(rset)
+
+        if self._has_zone_or_channel:
+            # Menu 10: Zone or Channel
+            rs = RadioSettingValueList(self._zone_or_channel_list,
+                                       current_index=_settings.zone_or_channel)
+            rset = MemSetting("settings.zone_or_channel",
+                              "Zone or Channel", rs)
+            rset.set_warning(
+                 "Changing this setting requires saving the .IMG file and "
+                 "opening it back up to enable/disable the Banks (Zones) "
+                 "preview tab.")  # and the Zone Name sub-menu.")
+            rset.set_doc(
+                "Set Zone Mode (static banks) or Full Channel "
+                "(flat) memmory channel mode.")
             spec.append(rset)
 
         # VFO A/B settings
@@ -788,12 +931,24 @@ class RT900BT(chirp_common.CloneModeRadio):
         # Menu 21: VFO A/B BCL (Busy lock)
         rs = RadioSettingValueBoolean(_settings.busy_lock)
         rset = MemSetting("settings.busy_lock", "BCL", rs)
+        rset.set_doc("Set Busy Channel Lockout. When selected, disables PTT "
+                     "when the current frequency is busy.")
+        abblock.append(rset)
+
+        # Menu 30 VFO DTMF code
+        rs = RadioSettingValueList(
+            PTTID_LIST,
+            current_index=_settings.pttid
+        )
+        rset = MemSetting("settings.pttid", "DTMF Code", rs)
+        rset.set_doc("Set when to send PTT-ID DTMF codes")
         abblock.append(rset)
 
         # Menu 42: TX-A/B
         rs = RadioSettingValueList(
             DUALTX_LIST, current_index=_settings.dualtx)
         rset = MemSetting("settings.dualtx", "TX-A/B", rs)
+        rset.set_doc("Set which Band will be used for TX when PTT is pressed.")
         abblock.append(rset)
 
         # VFO A channel sub menu
@@ -804,6 +959,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         rs = RadioSettingValueList(WORKMODE_LIST,
                                    current_index=_settings.vfomra)
         rset = MemSetting("settings.vfomra", "Work Mode", rs)
+        rset.set_doc("Set A Band Work Mode.")
         achannel.append(rset)
 
         # VFO A Freq
@@ -846,23 +1002,27 @@ class RT900BT(chirp_common.CloneModeRadio):
         rs.set_validate_callback(freq_validate)
         rset = RadioSetting("vfo.a.freq", "Frequency", rs)
         rset.set_apply_callback(apply_freq, vfo.a)
+        rset.set_doc("Set A Band VFO frequency.")
         achannel.append(rset)
 
         # Menu 01: A Step
         rs = RadioSettingValueMap(self._step_map, vfo.a.step)
         rset = MemSetting("vfo.a.step", "Tuning Step", rs)
+        rset.set_doc("Set A Band frequency Tuning Step.")
         achannel.append(rset)
 
         # Menu 02: TX Power
         rs = RadioSettingValueList([str(x) for x in self.POWER_LEVELS],
                                    current_index=vfo.a.txpower)
         rset = MemSetting("vfo.a.txpower", "TX Power", rs)
+        rset.set_doc("Set A Band TX Power.")
         achannel.append(rset)
 
         # Menu 05: Wide/Narrow Band
         rs = RadioSettingValueList(self._bandwidth_list,
                                    current_index=vfo.a.widenarr)
         rset = MemSetting("vfo.a.widenarr", "Bandwidth", rs)
+        rset.set_doc("Set A Band Bandwidth.")
         achannel.append(rset)
 
         # Menu 12,13: RX ctcss/dtsc
@@ -872,6 +1032,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         rset = RadioSetting("vfo.a.rxtone", "RX CTCSS/DCS", rs)
         rset.set_apply_callback(self.apply_vfo_tone,
                                 self._memobj.vfo.a, "rxtone")
+        rset.set_doc("Set A Band RX CTCSS or DCS code.")
         achannel.append(rset)
 
         # Menu 14,15: TX ctcss/dtsc
@@ -881,6 +1042,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         rset = RadioSetting("vfo.a.txtone", "TX CTCSS/DCS", rs)
         rset.set_apply_callback(self.apply_vfo_tone,
                                 self._memobj.vfo.a, "txtone")
+        rset.set_doc("Set A Band TX CTCSS or DCS code.")
         achannel.append(rset)
 
         # Menu 16: Voice Privacy (encryption)
@@ -888,6 +1050,7 @@ class RT900BT(chirp_common.CloneModeRadio):
                                    current_index=vfo.a.voicepri)
         rset = RadioSetting("vfo.a.voicepri",
                             "Voice Privacy - Subtone Encryption", rs)
+        rset.set_doc("Set A Band Voice Privacy - subtone voice encryption.")
         achannel.append(rset)
 
         def convert_bytes_to_offset(bytes):
@@ -907,23 +1070,27 @@ class RT900BT(chirp_common.CloneModeRadio):
                                      convert_bytes_to_offset(vfo.a.offset))
         rset = RadioSetting("vfo.a.offset", "Offset (MHz)", rs)
         rset.set_apply_callback(apply_offset, vfo.a)
+        rset.set_doc("Set A Band TX frequency offset value.")
         achannel.append(rset)
 
         # Menu 27: Offset direction
         rs = RadioSettingValueList(self._offset_list,
                                    current_index=vfo.a.sftd)
         rset = MemSetting("vfo.a.sftd", "Offset Direction", rs)
+        rset.set_doc("Set A Band TX frequency offset direction.")
         achannel.append(rset)
 
         # Menu 29: S-Code DTMF 1-15
         rs = RadioSettingValueList(self._scode_list,
                                    current_index=vfo.a.scode)
         rset = MemSetting("vfo.a.scode", "S-CODE", rs)
+        rset.set_doc("Set the A Band DTMF code ID to use for PTT ID.")
         achannel.append(rset)
 
         # Menu 45: Scramble
         rs = RadioSettingValueMap(self._scramble_map, vfo.a.scramble)
         rset = MemSetting("vfo.a.scramble", "Scramble", rs)
+        rset.set_doc("Set A Band voice Scramble.")
         achannel.append(rset)
 
         # Menu 50: RX Modulation
@@ -931,6 +1098,7 @@ class RT900BT(chirp_common.CloneModeRadio):
             rs = RadioSettingValueList(self._rx_modulation_list,
                                        current_index=vfo.a.rxmod)
             rset = MemSetting("vfo.a.rxmod", "RX Modulation", rs)
+            rset.set_doc("Set A Band RX Modulation.")
             achannel.append(rset)
 
         # VFO B channel sub menu
@@ -941,6 +1109,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         rs = RadioSettingValueList(WORKMODE_LIST,
                                    current_index=_settings.vfomrb)
         rset = MemSetting("settings.vfomrb", "Work Mode", rs)
+        rset.set_doc("Set B Band Work Mode.")
         bchannel.append(rset)
 
         # VFO B Freq
@@ -949,23 +1118,27 @@ class RT900BT(chirp_common.CloneModeRadio):
         rs.set_validate_callback(freq_validate)
         rset = RadioSetting("vfo.b.freq", "Frequency", rs)
         rset.set_apply_callback(apply_freq, vfo.b)
+        rset.set_doc("Set B Band VFO frequency.")
         bchannel.append(rset)
 
         # Menu 01: B Step
         rs = RadioSettingValueMap(self._step_map, vfo.b.step)
         rset = MemSetting("vfo.b.step", "Tuning Step", rs)
+        rset.set_doc("Set B Band frequency Tuning Step.")
         bchannel.append(rset)
 
         # Menu 02: TX Power
         rs = RadioSettingValueList([str(x) for x in self.POWER_LEVELS],
                                    current_index=vfo.b.txpower)
         rset = MemSetting("vfo.b.txpower", "TX Power", rs)
+        rset.set_doc("Set B Band TX Power.")
         bchannel.append(rset)
 
         # Menu 05: Wide/Narrow Band
         rs = RadioSettingValueList(self._bandwidth_list,
                                    current_index=vfo.b.widenarr)
         rset = MemSetting("vfo.b.widenarr", "Bandwidth", rs)
+        rset.set_doc("Set B Band Bandwidth.")
         bchannel.append(rset)
 
         # Menu 12,13: RX ctcss/dtsc
@@ -975,6 +1148,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         rset = RadioSetting("vfo.b.rxtone", "RX CTCSS/DCS", rs)
         rset.set_apply_callback(self.apply_vfo_tone,
                                 self._memobj.vfo.b, "rxtone")
+        rset.set_doc("Set B Band RX CTCSS or DCS code.")
         bchannel.append(rset)
 
         # Menu 14,15: TX ctcss/dtsc
@@ -984,6 +1158,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         rset = RadioSetting("vfo.b.txtone", "TX CTCSS/DCS", rs)
         rset.set_apply_callback(self.apply_vfo_tone,
                                 self._memobj.vfo.b, "txtone")
+        rset.set_doc("Set B Band TX CTCSS or DCS code.")
         bchannel.append(rset)
 
         # Menu 16: Voice Privacy (encryption)
@@ -991,6 +1166,7 @@ class RT900BT(chirp_common.CloneModeRadio):
                                    current_index=vfo.b.voicepri)
         rset = MemSetting("vfo.b.voicepri",
                           "Voice Privacy - Subtone Encryption", rs)
+        rset.set_doc("Set B Band Voice Privacy - subtone voice encryption.")
         bchannel.append(rset)
 
         # Menu 26: Offset
@@ -998,22 +1174,26 @@ class RT900BT(chirp_common.CloneModeRadio):
                                      convert_bytes_to_offset(vfo.b.offset))
         rset = RadioSetting("vfo.b.offset", "Offset (MHz)", rs)
         rset.set_apply_callback(apply_offset, vfo.b)
+        rset.set_doc("Set B Band TX frequency offset value.")
         bchannel.append(rset)
 
         # Menu 27: Offset direction
         rs = RadioSettingValueList(self._offset_list, current_index=vfo.b.sftd)
         rset = MemSetting("vfo.b.sftd", "Offset Direction", rs)
+        rset.set_doc("Set B Band TX frequency offset direction.")
         bchannel.append(rset)
 
         # Menu 29: S-Code DTMF 1-15
         rs = RadioSettingValueList(
             self._scode_list, current_index=vfo.b.scode)
         rset = MemSetting("vfo.b.scode", "S-CODE", rs)
+        rset.set_doc("Set the B Band DTMF code ID to use for PTT ID.")
         bchannel.append(rset)
 
         # Menu 45: Scramble
         rs = RadioSettingValueMap(self._scramble_map, vfo.b.scramble)
         rset = MemSetting("vfo.b.scramble", "Scramble", rs)
+        rset.set_doc("Set B Band voice Scramble.")
         bchannel.append(rset)
 
         # Menu 50: RX Modulation
@@ -1021,7 +1201,82 @@ class RT900BT(chirp_common.CloneModeRadio):
             rs = RadioSettingValueList(self._rx_modulation_list,
                                        current_index=vfo.b.rxmod)
             rset = MemSetting("vfo.b.rxmod", "RX Modulation", rs)
+            rset.set_doc("Set B Band RX Modulation.")
             bchannel.append(rset)
+
+        # SSB Settings, RT-920, BJ7800 Only
+        if self._has_hf:
+            ssbblock = RadioSettingGroup("ssbblock", "FM/AM/SSB Modulation")
+            spec.append(ssbblock)
+
+            # HF mode submenu
+            modes = RadioSettingSubGroup("modes", "Modes")
+            ssbblock.append(modes)
+
+            # SSB Work Mode
+            ssbwm = self._memobj.ssb_settings
+            rs = RadioSettingValueList(
+                self._ssb_workmode_list,
+                current_index=ssbwm.workmode
+            )
+            rset = MemSetting("ssb_settings.workmode", "Work Mode", rs)
+            rset.set_doc("Set HF Workmode.")
+            modes.append(rset)
+
+            # SSB Modulation Mode
+            ssb = self._memobj.ssb
+            rs = RadioSettingValueList(
+                self._ssb_modulation_list,
+                current_index=ssb.modulation
+            )
+            rset = MemSetting("ssb.modulation", "Modulation Mode", rs)
+            rset.set_doc("Set HF RX Modulation Mode.")
+            modes.append(rset)
+
+            # AM mode submenu
+            amsettings = RadioSettingSubGroup("amsettings", "AM Settings")
+            ssbblock.append(amsettings)
+
+            # AM Step Freq
+            stepfreq = self._memobj.stepfreq
+            rs = RadioSettingValueList(
+                self._am_step_freq_list,
+                current_index=stepfreq.am
+            )
+            rset = MemSetting("stepfreq.am", "Step Freq", rs)
+            rset.set_doc("Set HF AM RX Step Frequency.")
+            amsettings.append(rset)
+
+            # AM RX Gain
+            rs = RadioSettingValueList(
+                self._rx_gain_list,
+                current_index=ssb.am_rxgain
+            )
+            rset = MemSetting("ssb.am_rxgain", "RX Gain", rs)
+            rset.set_doc("Set HF AM RX Gain value.")
+            amsettings.append(rset)
+
+            # SSB mode submenu
+            ssbsettings = RadioSettingSubGroup("ssbsettings", "SSB Settings")
+            ssbblock.append(ssbsettings)
+
+            # SSB Step Freq
+            rs = RadioSettingValueList(
+                self._ssb_step_freq_list,
+                current_index=stepfreq.ssb
+            )
+            rset = MemSetting("stepfreq.ssb", "Step Freq", rs)
+            rset.set_doc("Set HF SSB RX Step Frequency.")
+            ssbsettings.append(rset)
+
+            # SSB RX Gain
+            rs = RadioSettingValueList(
+                self._rx_gain_list,
+                current_index=stepfreq.ssb_rxgain
+            )
+            rset = MemSetting("stepfreq.ssb_rxgain", "RX Gain", rs)
+            rset.set_doc("Set HF SSB RX Gain value.")
+            ssbsettings.append(rset)
 
         return group
 
@@ -1075,7 +1330,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         """Parse the tone data to encode from UI to mem"""
         match mode:
             case "" | None:
-                memval.set_raw("\x00\x00")
+                memval.fill_raw(b"\x00")
             case "Tone" | "TSQL":
                 memval.set_value(int(value * 10))
             case "DTCS":
@@ -1157,7 +1412,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         # Memory number
         mem.number = number
 
-        if _mem.get_raw()[:1] == b"\xFF":
+        if _mem.get_raw()[:1] == b"\xff":
             mem.empty = True
             return mem
 
@@ -1166,7 +1421,7 @@ class RT900BT(chirp_common.CloneModeRadio):
         if mem.freq == 0:
             mem.empty = True
         # tx freq can be blank
-        if _mem.txfreq.get_raw() == b"\xFF\xFF\xFF\xFF":
+        if _mem.txfreq.get_raw() == b"\xff\xff\xff\xff":
             # TX freq not set
             mem.offset = 0
             mem.duplex = "off"
@@ -1238,16 +1493,39 @@ class RT900BT(chirp_common.CloneModeRadio):
         # BCL (Busy Channel Lockout)
         rs = RadioSettingValueBoolean(_mem.bcl)
         rset = RadioSetting("bcl", "BCL", rs)
+        rset.set_doc("Set Busy Channel Lockout. When selected, disables PTT "
+                     "when the current channel is busy.")
+        mem.extra.append(rset)
+
+        # LearnFHSS (per-channel learn / FHSS flag). The OEM CPS labels
+        # this column "LearnFHSS"; the open-source firmware reads the
+        # same bit as chFlag3.b0 / fhssFlag (Core/Radio.c).
+        rs = RadioSettingValueBoolean(_mem.learning)
+        rset = RadioSetting("learning", "Learn FHSS", rs)
+        rset.set_doc("Enable to allow automatic FHSS code selection.")
+        mem.extra.append(rset)
+
+        # FHSS Code (24-bit little-endian, range 0x000000-0x7FFFFF).
+        # Displayed and accepted as a 6-digit uppercase hex string, or
+        # blank to clear the code (raw 0xFFFFFF). Validation is hoisted
+        # to a module-level function so this RadioSetting stays
+        # picklable for clipboard copy.
+        rs = RadioSettingValueString(0, 6, _fhss_code_to_text(_mem.code))
+        rs.set_validate_callback(_validate_fhss_code)
+        rset = RadioSetting("fhss_code", "FHSS Code (hex)", rs)
+        rset.set_doc("Enter manual FHSS Code using HEX digits.")
         mem.extra.append(rset)
 
         # PTT-ID
         rs = RadioSettingValueList(PTTID_LIST, current_index=_mem.pttid)
         rset = RadioSetting("pttid", "PTT ID", rs)
+        rset.set_doc("Set when the PTT-ID is to be sent.")
         mem.extra.append(rset)
 
         # Signal (DTMF Encoder Group #)
         rs = RadioSettingValueList(PTTIDCODE_LIST, current_index=_mem.scode)
         rset = RadioSetting("scode", "PTT ID Code", rs)
+        rset.set_doc("Set the DTMF code ID to use for PTT ID.")
         mem.extra.append(rset)
 
         return mem
@@ -1256,15 +1534,15 @@ class RT900BT(chirp_common.CloneModeRadio):
         _mem = self._memobj.memory[mem.number - 1]
 
         if mem.empty:
-            _mem.set_raw("\xff" * 32)
+            _mem.fill_raw(b"\xff")
             return
 
-        _mem.set_raw("\x00" * 16 + "\xFF" * 16)
+        _mem.set_raw("\x00" * 16 + "\xff" * 16)
 
         _mem.rxfreq = mem.freq / 10
 
         if mem.duplex == "off":
-            _mem.txfreq.fill_raw(b"\xFF")
+            _mem.txfreq.fill_raw(b"\xff")
         elif mem.duplex == "split":
             _mem.txfreq = mem.offset / 10
         elif mem.duplex == "+":
@@ -1279,7 +1557,7 @@ class RT900BT(chirp_common.CloneModeRadio):
             try:
                 _mem.name[i] = mem.name[i]
             except IndexError:
-                _mem.name[i] = "\xFF"
+                _mem.name[i] = "\xff"
 
         txmode = rxmode = ''
         txval = rxval = 0
@@ -1321,7 +1599,19 @@ class RT900BT(chirp_common.CloneModeRadio):
                 _mem.narrow = 0b1
 
         for setting in mem.extra:
-            setattr(_mem, setting.get_name(), setting.value)
+            if setting.get_name() == 'fhss_code':
+                # Mirror OEM CPS: blank input clears Code (0xFFFFFF) and
+                # restores the adjacent flag byte to 0xFF; any value
+                # writes Code and sets the flag byte to 0xA0.
+                s = str(setting.value).strip()
+                if s == "":
+                    _mem.code = FHSS_CODE_NULL
+                    _mem.code_flag = FHSS_CODE_FLAG_NULL
+                else:
+                    _mem.code = int(s, 16)
+                    _mem.code_flag = FHSS_CODE_FLAG_ACTIVE
+            else:
+                setattr(_mem, setting.get_name(), setting.value)
 
     def validate_memory(self, mem):
         msgs = []
@@ -1351,7 +1641,7 @@ class RT900(RT900BT):
     # ==========
     # Notice to developers:
     # The RT-900 support in this driver is currently based upon stock
-    # factory firmware.
+    # factory firmware, V0.14P
     # ==========
 
     """Radtel RT-900 (without Bluetooth)"""
@@ -1362,8 +1652,9 @@ class RT900(RT900BT):
     _has_am_per_channel = False
     _has_am_switch = not _has_am_per_channel
     _has_single_mode = False
+    _has_hf = False
 
-    _upper = 512  # fw 1.04P expands from 256 to 512 channels
+    _upper = 999  # fw V1.14P expands from 512 to 999 channels
 
     SKEY_LIST = ["FM Radio",
                  "TX Power Level",
@@ -1385,7 +1676,8 @@ class RT900(RT900BT):
     def get_prompts(cls):
         rp = super().get_prompts()
         rp.experimental = \
-            ('This driver is a beta version for the RT-900\n'
+            ('This driver is a beta version for the RT-900'
+             ' running Firmware V0.14P\n'
              '\n'
              'Please save an unedited copy of your first successful\n'
              'download to a CHIRP Radio Images(*.img) file.\n\n'
@@ -1398,7 +1690,7 @@ class RT900(RT900BT):
 class RT910BT(RT900BT):
     # ==========
     # Notice to developers:
-    # The RT-910 BT support in this driver is currently based upon Vx.yyP
+    # The RT-910 BT support in this driver is currently based upon V0.24P
     # firmware with 15 banks/zones of 64 channels steps.
     # ==========
     """Radtel RT-910_BT 960"""
@@ -1438,7 +1730,7 @@ class RT910BT(RT900BT):
 
     def get_features(self):
         rf = super().get_features()
-        rf.has_bank = True  # Firmware Vx.yyP supports 15
+        rf.has_bank = True  # Firmware V0.24P supports 15
         #                     "static zones" of 64 frequencies
         rf.valid_tuning_steps = self._steps
         return rf
@@ -1448,7 +1740,7 @@ class RT910BT(RT900BT):
         rp = super().get_prompts()
         rp.experimental = \
             ('This driver is a beta version for the RT-910 BT'
-             ' running Firmware V0x.yy\n'
+             ' running Firmware V0.24P\n'
              '\n'
              'Please save an unedited copy of your first successful\n'
              'download to a CHIRP Radio Images(*.img) file.\n\n'
@@ -1486,6 +1778,7 @@ class RT910(RT910BT):
     _has_am_per_channel = True
     _has_am_switch = not _has_am_per_channel
     _has_single_mode = True
+    _has_hf = False
 
     def get_bank_model(self):
         return chirp_common.StaticBankModel(self, banks=15)
@@ -1495,7 +1788,7 @@ class RT910(RT910BT):
         rp = super().get_prompts()
         rp.experimental = \
             ('This driver is a beta version for the RT-910'
-             ' Non Bluetooth running Firmware V0.11\n'
+             ' Non-Bluetooth running Firmware V0.11\n'
              '\n'
              'Please save an unedited copy of your first successful\n'
              'download to a CHIRP Radio Images(*.img) file.\n\n'
@@ -1504,19 +1797,47 @@ class RT910(RT910BT):
         return rp
 
 
+class RT920Bank(chirp_common.NamedBank):
+    """RT-920 Bank"""
+    def get_name(self):
+        """decode bank name from char array into string"""
+        _bank = self._model._radio._memobj.zones[self._index - 1]
+        name = str(_bank.name).rstrip(" \n\t\x00\xff")  # remove filler chars
+
+        if len(name) == 0:
+            name = "ZONE %i" % self._index
+
+        return name
+
+    def set_name(self, name):
+        """encode bank name into \xff filled char array"""
+        _bank = self._model._radio._memobj.zones[self._index - 1]
+        _bank.name = name[:len(_bank.name)].rstrip()\
+            .ljust(len(_bank.name), "\xff")
+
+
+class RT920BankModel(chirp_common.StaticBankModel):
+    """RT-920 Bank Model"""
+    def __init__(self, radio, name, banks):
+        super(RT920BankModel, self).__init__(radio, name, banks)
+        self._num_banks = banks
+        self._rf = radio.get_features()
+        self._banks = []
+        for i in range(self._num_banks):
+            self._banks.append(RT920Bank(self, i + 1, "ZONE %i" % (i + 1)))
+
+
 @directory.register
 class RT920(RT900BT):
     # ==========
     # Notice to developers:
-    # The RT-920 support in this driver is currently based upon V0.14P
-    # firmware with 15 banks/zones of 64 channels steps.
-    # Also known to work on the SHJ H28Y Pro V0.07 firmware
+    # The RT-920 support in this driver is currently based upon V0.18
+    # firmware with 10 banks/zones of 99 channels.
     # ==========
     """Radtel RT-920"""
     VENDOR = "Radtel"
     MODEL = "RT-920"
 
-    # _magic = b"PROGRAMBT80U"  # RT-900
     _magic = b"PROGRAMBT11U"  # RT-920
     #  step of 1.25 to allow UK CB Freqs
     _steps = [1.25, 2.5, 5.0, 6.25, 8.33, 10.0, 12.5, 20.0, 25.0, 50.0]
@@ -1529,47 +1850,465 @@ class RT920(RT900BT):
                  "SOS",
                  "Spectrum"]
     SKEY_SP_LIST = SKEY_LIST + ["PTTB"]
+    _zone_or_channel_list = ["Zone Mode", "Full Channel"]
+    _ssb_modulation_list = [
+        "FM",
+        "AM",
+        "LSB",
+        "USB",
+        "CW",
+    ]
+    _ssb_workmode_list = [
+        "VFO Mode",
+        "CH Mode",
+    ]
+    _am_step_freq_list = [
+        "1K",
+        "5K",
+        "9K",
+        "10K",
+        "100K",
+    ]
+    _ssb_step_freq_list = [
+        "1K",
+        "5K",
+        "10K",
+        "100K",
+        "500K",
+        "1000K",
+    ]
+    _rx_gain_list = ["AGC"] + \
+        ["%ddB" % x for x in range(0, -36, -1)]
 
-    _upper = 960  # fw V0.24P supports 960 channels
+    _upper = 990  # fw V0.18 supports 990 channels
     _mem_params = (_upper,  # number of channels
                    )
+    _banks = 10
     _ranges = [
-        (0x0000, 0x7800),  # 15 zones of 64 frequencies,
-                           # equals 960 channels of 32 bytes each
-                           # 15 * 64 * 32 = 0x7800
+        (0x0000, 0x7BC0),  # 10 zones of 99 frequencies,
+                           # equals 990 channels of 32 bytes each
+                           # 10 * 99 * 32 = 0x7BC0
         (0x8000, 0x8040),
         (0x9000, 0x9040),
         (0xA000, 0xA140),
-        (0xD000, 0xD040)  # Radio mode hidden setting
+        (0xB000, 0xB400),  # FM, AM, HF frequencies
+        (0xC000, 0xC400),  # FM, AM, HF names
+        (0xC800, 0XC8A0),  # static bank names, 10 banks * 16 bytes ea = 0xA0
+        (0xD000, 0xD040),  # Radio mode hidden setting
     ]
+
+    _rt920_specific_fmt = """
+    #seekto 0xb000;
+    // 2 byte fm vfo freq
+    struct {
+        ul16 freq;
+    } fm_vfo;
+    // 15ea 2 byte fm chan freq
+    struct {
+        ul16 freq;
+    } fm_freqs[%d];
+
+    #seekto 0xb021; // SSB settings
+    struct {
+        u8 workmode; // VFO/Ch
+    } ssb_settings;
+
+    #seekto 0xb022;
+    // 2 byte am vfo freq
+    struct {
+        ul16 freq;
+    } am_vfo;
+    // 15ea 2 byte am chan freq
+    struct {
+        ul16 freq;
+    } am_freqs[%d];
+
+    #seekto 0xb043; // ssb
+    struct {
+        u8 modulation; // modulation mode
+        u8 am_rxgain; // AM RX gain
+    } ssb;
+
+    #seekto 0xb045;
+    // 5 byte hf vfo chan
+    struct {
+        ul16 freq;
+        u8 bandwidth;
+        il16 beatfreq; // can be negitive
+    } hf_vfo;
+    // 15ea 5 byte hf chans
+        struct {
+        ul16 freq;
+        u8 bandwidth;
+        il16 beatfreq; // can be negitive
+    } hf_freqs[%d];
+
+    #seekto 0xb096;
+    struct {
+        u8 ssb;
+        u8 am;
+        u8 ssb_rxgain;
+    } stepfreq;
+
+    #seekto 0xc010; // 15ea 16 byte fm chan names
+    struct {
+        char name[12];
+        u8 unused[4];
+    } fm_names[%d];
+
+    #seekto 0xc110; // 15ea 16 byte am chan names (RT-920 fw v 0.xx)
+    struct {
+        char name[12];
+        u8 unused[4];
+    } am_names[%d];
+
+    #seekto 0xc210; // 15ea 16 byte ssb chan names (RT-920 fw v 0.xx)
+    struct {
+        char name[12];
+        u8 unused[4];
+    } hf_names[%d];
+
+    #seekto 0xC800; // 10ea 16 byte zone names (RT-920 fw V0.17)
+    struct {
+      char name[10];
+      u8 unused[6];
+    } zones[%d];
+    """
 
     _has_bt_denoise = True
     _has_am_per_channel = True
     _has_am_switch = not _has_am_per_channel
-    _has_single_mode = False
+    _has_single_mode = True
+    _has_zone_or_channel = True
+    _has_zone_names = True
+    _has_sp0 = False  # spkey addresses are not shifted
+    _has_hf = True
 
     def get_bank_model(self):
-        return chirp_common.StaticBankModel(self, banks=15)
+        return RT920BankModel(self, "Zones", self._banks)
 
     def get_features(self):
         rf = super().get_features()
-        rf.has_bank = True  # Firmware V0.14P supports 15
-        #                     "static zones" of 64 frequencies
+        # Firmware V0.18 supports 10
+        # optional "static zones" of 99 frequencies
+        # or 990 flat chanels
+        if self._memobj is not None and hasattr(self._memobj, "settings"):
+            rf.has_bank = not self._memobj.settings.zone_or_channel
+        else:
+            rf.has_bank = False  # default to flat mode if settings not init'ed
+
+        rf.has_bank_names = self._has_zone_names
         rf.valid_tuning_steps = self._steps
+        rf.has_sub_devices = self._has_hf
         return rf
+
+    def process_mmap(self):
+        AUX_CHANS_FM = AUX_CHANS_AM = AUX_CHANS_HF = 15
+        mem_format = MEM_FORMAT % self._mem_params + \
+            self._rt920_specific_fmt % (
+                AUX_CHANS_FM,
+                AUX_CHANS_AM,
+                AUX_CHANS_HF,
+                AUX_CHANS_FM,
+                AUX_CHANS_AM,
+                AUX_CHANS_HF,
+                self._banks,
+            )
+        self._memobj = bitwise.parse(mem_format, self._mmap)
 
     @classmethod
     def get_prompts(cls):
         rp = super().get_prompts()
         rp.experimental = \
             ('This driver is a beta version for the RT-920'
-             ' running Firmware V0.14P\n'
+             ' running Firmware V0.18\n'
              '\n'
              'Please save an unedited copy of your first successful\n'
              'download to a CHIRP Radio Images(*.img) file.\n\n'
              'PROCEED AT YOUR OWN RISK!'
              )
         return rp
+
+    def get_sub_devices(self):
+        return [RT920VhfUfh(self._mmap),
+                RT920FM(self._mmap),
+                RT920AM(self._mmap),
+                RT920HF(self._mmap),
+                ]
+
+
+class RT920VhfUfh(RT920):
+    """Radtel RT-920 VHF/UHF subdevice"""
+    VENDOR = "Radtel"
+    MODEL = "RT-920"
+    VARIANT = "VHF/UHF"
+
+
+class RT920FM(RT920):
+    """Radtel RT-920 FM broadcast subdevice"""
+    VENDOR = "Radtel"
+    MODEL = "RT-920"
+    VARIANT = "FM Broadcast"
+
+    _upper = 15
+    _mem_params = (_upper,  # number of channels
+                   )
+    _valid_bands = [(64000000, 108000000)]  # in Mhz, 64.0-108 MHz
+    SPECIAL_CHANNELS = ["VFO"]
+
+    def get_features(self):
+        rf = chirp_common.RadioFeatures()
+        rf.valid_bands = self._valid_bands
+        rf.memory_bounds = (1, self._upper)
+        rf.can_delete = True
+        rf.can_odd_split = False
+        rf.has_bank = False
+        rf.has_bank_index = False
+        rf.has_bank_names = False
+        rf.has_comment = False
+        rf.has_cross = False
+        rf.has_ctone = False
+        rf.has_dtcs = False
+        rf.has_dtcs_polarity = False
+        rf.has_mode = True
+        rf.has_offset = False
+        rf.has_settings = False
+        rf.has_sub_devices = False
+        rf.has_tuning_step = False
+        rf.valid_characters = RT900._valid_chars
+        rf.valid_cross_modes = []
+        rf.valid_dtcs_codes = []
+        rf.valid_dtcs_pols = []
+        rf.valid_duplexes = []
+        rf.valid_modes = ["AM", "WFM", "Auto"]
+        rf.valid_name_length = 12
+        rf.valid_skips = []
+        rf.valid_special_chans = self.SPECIAL_CHANNELS
+        rf.valid_tuning_steps = [
+            1.0, 2.5, 5.0, 6.25, 8.33, 10.0, 12.5, 20.0, 25.0, 50.0,
+            ]
+        rf.valid_tmodes = []
+        rf.valid_tones = []
+        return rf
+
+    def get_raw_memory(self, number):
+        if isinstance(number, str):
+            return repr(self._memobj.fm_vfo)
+        else:
+            return (repr(self._memobj.fm_freqs[number - 1]) +
+                    repr(self._memobj.fm_names[number - 1]))
+
+    def get_memory(self, number):
+        mem = chirp_common.Memory()
+
+        if isinstance(number, str):
+            mem.number = self._upper + self.SPECIAL_CHANNELS.index(number) + 1
+            mem.extd_number = number
+            _mem = self._memobj.fm_vfo
+        else:
+            mem.number = number
+            _mem = self._memobj.fm_freqs[number - 1]
+            _name = self._memobj.fm_names[number - 1]
+
+        freq = int(_mem.freq) * 10000
+
+        if freq == 0:
+            mem.empty = True
+            return mem
+
+        mem.freq = freq
+
+        if mem.number > self._upper:
+            mem.immutable += ["name"]
+        else:
+            mem.name = str(_name.name).rstrip("\xff ")
+
+        mem.mode = "WFM"
+
+        mem.immutable += ["mode", "ctone", "rtone"]
+        return mem
+
+    def set_memory(self, mem):
+
+        if mem.number > self._upper:
+            _mem = self._memobj.fm_vfo
+        else:
+            _mem = self._memobj.fm_freqs[mem.number - 1]
+            _name = self._memobj.fm_names[mem.number - 1]
+
+        if mem.empty:
+            _mem.freq.fill_raw(b"\x00")
+            if mem.number <= self._upper:
+                _name.name.fill_raw(b"\xff")
+            return
+
+        _mem.freq = int(mem.freq / 10000)
+
+        if mem.number <= self._upper:
+            _name.name = mem.name.ljust(12, "\xff")
+
+
+class RT920AM(RT920FM):
+    """Radtel RT-920 AM broadcast subdevice"""
+    VENDOR = "Radtel"
+    MODEL = "RT-920"
+    VARIANT = "AM Broadcast"
+
+    _valid_bands = [(153000, 279000),     # in Mhz, 153-279 KHz
+                    (520000, 1710000),    # 520-1710 KHz
+                    (2300000, 26100000),  # 2300-26100 KHz
+                    ]
+
+    def get_raw_memory(self, number):
+        if isinstance(number, str):
+            return repr(self._memobj.am_vfo)
+        else:
+            return (repr(self._memobj.am_freqs[number - 1]) +
+                    repr(self._memobj.am_names[number - 1]))
+
+    def get_memory(self, number):
+        mem = chirp_common.Memory()
+
+        if isinstance(number, str):
+            mem.number = self._upper + self.SPECIAL_CHANNELS.index(number) + 1
+            mem.extd_number = number
+            _mem = self._memobj.am_vfo
+        else:
+            mem.number = number
+            _mem = self._memobj.am_freqs[number - 1]
+            _name = self._memobj.am_names[number - 1]
+
+        freq = int(_mem.freq) * 1000
+
+        if freq == 0:
+            mem.empty = True
+            return mem
+
+        mem.freq = freq
+
+        if mem.number > self._upper:
+            mem.immutable += ["name"]
+        else:
+            mem.name = str(_name.name).rstrip("\xff ")
+
+        mem.mode = "AM"
+
+        mem.immutable += ["mode", "ctone", "rtone"]
+        return mem
+
+    def set_memory(self, mem):
+
+        if mem.number > self._upper:
+            _mem = self._memobj.am_vfo
+        else:
+            _mem = self._memobj.am_freqs[mem.number - 1]
+            _name = self._memobj.am_names[mem.number - 1]
+
+        if mem.empty:
+            _mem.freq.fill_raw(b"\x00")
+            if mem.number <= self._upper:
+                _name.name.fill_raw(b"\xff")
+            return
+
+        _mem.freq = int(mem.freq / 1000)
+
+        if mem.number <= self._upper:
+            _name.name = mem.name.ljust(12, "\xff")
+
+
+class RT920HF(RT920FM):
+    """Radtel RT-920 HF LSB, USB, CW subdevice"""
+    VENDOR = "Radtel"
+    MODEL = "RT-920"
+    VARIANT = "HF"
+
+    _valid_bands = [(150000, 30000000)]  # in Mhz, 150-30000 KHz
+
+    _ssb_bandwidth_list = [
+        "0.5K", "1.0K", "1.2K", "2.2K", "3.0K", "4.0K",
+    ]
+
+    def get_raw_memory(self, number):
+        if isinstance(number, str):
+            return repr(self._memobj.hf_vfo)
+        else:
+            return (repr(self._memobj.hf_freqs[number - 1]) +
+                    repr(self._memobj.hf_names[number - 1]))
+
+    def get_memory(self, number):
+        mem = chirp_common.Memory()
+
+        if isinstance(number, str):
+            mem.number = self._upper + self.SPECIAL_CHANNELS.index(number) + 1
+            mem.extd_number = number
+            _mem = self._memobj.hf_vfo
+        else:
+            mem.number = number
+            _mem = self._memobj.hf_freqs[number - 1]
+            _name = self._memobj.hf_names[number - 1]
+
+        freq = int(_mem.freq) * 1000
+
+        if freq == 0:
+            mem.empty = True
+            return mem
+
+        mem.freq = freq
+
+        if mem.number > self._upper:
+            mem.immutable += ["name"]
+        else:
+            mem.name = str(_name.name).rstrip("\xff ")
+
+        # use Modulation Mode from SSB settings to determine Mode
+        #   defaut to LSB if AM or FM is selected as SSB Modulation Mode
+        _ssb_mod = self._memobj.ssb.modulation
+        mem.mode = "LSB" if self._ssb_modulation_list[_ssb_mod] \
+            in ["AM", "FM"] else \
+            self._ssb_modulation_list[_ssb_mod]
+
+        mem.immutable += ["mode", "ctone", "rtone"]
+
+        mem.extra = RadioSettingGroup("Extra", "extra")
+
+        # Bandwidth
+        rs = RadioSettingValueList(
+            self._ssb_bandwidth_list,
+            current_index=int(_mem.bandwidth)
+        )
+        rset = RadioSetting("bandwidth", "Bandwidth", rs)
+        rset.set_doc("SSB Channel Bandwidth (KHz).")
+        mem.extra.append(rset)
+
+        # Beat Freq
+        rs = RadioSettingValueInteger(-32760, 27240, int(_mem.beatfreq), 1)
+        rset = RadioSetting("beatfreq", "Beat Freq Offset (Hz)", rs)
+        rset.set_doc("SSB Beat Frequency Offset (Hz).")
+        mem.extra.append(rset)
+
+        return mem
+
+    def set_memory(self, mem):
+
+        if mem.number > self._upper:
+            _mem = self._memobj.hf_vfo
+        else:
+            _mem = self._memobj.hf_freqs[mem.number - 1]
+            _name = self._memobj.hf_names[mem.number - 1]
+
+        if mem.empty:
+            _mem.fill_raw(b"\x00")
+            if mem.number <= self._upper:
+                _name.name.fill_raw(b"\xff")
+            return
+
+        _mem.freq = int(mem.freq / 1000)
+
+        if mem.number <= self._upper:
+            _name.name = mem.name.ljust(12, "\xff")
+
+        for setting in mem.extra:
+            setattr(_mem, setting.get_name(), int(setting.value))
 
 
 @directory.register
@@ -1610,3 +2349,81 @@ class RadioddityGS10B(RT900BT):
              'PROCEED AT YOUR OWN RISK!'
              )
         return rp
+
+
+@directory.register
+class BJ7800(RT920):
+    # ==========
+    # Notice to developers:
+    # The BJ7800 support in this driver is currently based upon V0.15P
+    # firmware with 15 banks/zones of 64 channels.
+    # Should also work with the SHU H28Y Pro
+    # ==========
+    """Bajeton BJ7800"""
+    VENDOR = "Bajeton"
+    MODEL = "BJ7800"
+
+    _upper = 960  # fw V0.15P supports 960 channels
+    _mem_params = (_upper,  # number of channels
+                   )
+    _banks = 15
+    _ranges = [
+        (0x0000, 0x7800),  # 15 zones of 64 frequencies,
+                           # equals 960 channels of 32 bytes each
+                           # 15 * 64 * 32 = 0X7800
+        (0x8000, 0x8040),
+        (0x9000, 0x9040),
+        (0xB000, 0xB400),  # FM, AM, HF frequencies
+        (0xC000, 0xC400),  # FM, AM, HF names
+        (0xA000, 0xA140),
+        (0xD000, 0xD040),   # Radio mode hidden setting
+    ]
+
+    _has_bt_denoise = True
+    _has_am_per_channel = True
+    _has_am_switch = not _has_am_per_channel
+    _has_single_mode = False
+    _has_zone_or_channel = False
+    _has_zone_names = False  # dosen't have named zones like the RT-920
+    _has_hf = True
+
+    def get_bank_model(self):
+        return chirp_common.StaticBankModel(self, banks=self._banks)
+
+    def get_features(self):
+        rf = super().get_features()
+        # Firmware V0.15P supports 15
+        # "static zones" of 64 frequencies
+        # for 960 channels
+        rf.has_bank = True
+        rf.has_bank_names = self._has_zone_names
+        rf.valid_tuning_steps = self._steps
+        rf.has_sub_devices = self._has_hf
+        return rf
+
+    @classmethod
+    def get_prompts(cls):
+        rp = super().get_prompts()
+        rp.experimental = \
+            ('This driver is a beta version for the BJ7800'
+             ' running Firmware V0.15P\n'
+             '\n'
+             'Please save an unedited copy of your first successful\n'
+             'download to a CHIRP Radio Images(*.img) file.\n\n'
+             'PROCEED AT YOUR OWN RISK!'
+             )
+        return rp
+
+    def get_sub_devices(self):
+        return [BJ7800VhfUfh(self._mmap),
+                RT920FM(self._mmap),
+                RT920AM(self._mmap),
+                RT920HF(self._mmap),
+                ]
+
+
+class BJ7800VhfUfh(BJ7800):
+    """Bajeton BJ7800 VHF/UHF subdevice"""
+    VENDOR = "Bajeton"
+    MODEL = "BJ7800"
+    VARIANT = "VHF/UHF"
